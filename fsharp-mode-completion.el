@@ -30,6 +30,7 @@
 (require 'json)
 (require 'etags)
 (require 'fsharp-mode-util)
+(require 'flycheck)
 
 (autoload 'pos-tip-fill-string "pos-tip")
 (autoload 'pos-tip-show "pos-tip")
@@ -96,11 +97,14 @@ If set to nil, display in a help buffer instead.")
 
 (defvar-local company-prefix nil)
 (defvar-local fsharp-company-callback nil)
+(defvar-local flycheck-callback nil)
+(defvar-local flycheck-checker nil)
 
 (defconst fsharp-ac--log-buf "*fsharp-debug*")
 (defconst fsharp-ac--completion-procname "fsharp-complete")
 (defconst fsharp-ac--completion-bufname
   (concat "*" fsharp-ac--completion-procname "*"))
+
 
 (defun fsharp-ac--log (str)
   (when fsharp-ac-debug
@@ -142,6 +146,38 @@ since the last request."
   (with-current-buffer (find-file-noselect file)
     (fsharp-ac-parse-current-buffer)))
 
+(defun fsharp-ac--flycheck-start (checker callback)
+  "Start an fsharp-ac syntax check with CHECKER.
+CALLBACK is the status callback passed by Flycheck." 
+  (setq flycheck-callback callback)
+  (setq flycheck-checker checker)
+
+  (fsharp-ac-parse-current-buffer)
+  (fsharp-ac-send-pos-request
+   "lint"
+   (fsharp-ac--buffer-truename)
+   (line-number-at-pos)
+   (+ 1 (current-column))))
+
+(flycheck-define-generic-checker 'fsharp-ac-flycheck
+  "Flycheck checker for fsharp"
+  :start #'fsharp-ac--flycheck-start
+  :modes '(fsharp-mode)
+  :predicate (lambda () (fsharp-ac-can-make-request 't)))
+
+;; These are selected automatically when flycheck is enabled
+(add-to-list 'flycheck-checkers 'fsharp-ac-flycheck)
+
+(defun fsharp-ac-lint ()
+  (interactive)
+
+  (clrhash fsharp-ac-current-helptext)
+  (fsharp-ac-parse-current-buffer)
+  (fsharp-ac-send-pos-request
+   "lint"
+   (fsharp-ac--buffer-truename)
+   (line-number-at-pos)
+   (+ 1 (current-column))))
 
 (defun fsharp-ac--isIdChar (c)
   (let ((gc (get-char-code-property c 'general-category)))
@@ -590,6 +626,22 @@ prevent usage errors being displayed by FSHARP-DOC-MODE."
                                                   :text  msg
                                                   :file  file)))))))
 
+(defun fsharp-ac-parse-lint (data)
+  "Extract the lint information from the given process response DATA. Return the list to flycheck"
+  (save-match-data
+  (let (parsed)
+    (dolist (lint-item data parsed)
+      (let* ((range (gethash "Range" lint-item))
+             (flycheck-item (flycheck-error-new
+                 :buffer (current-buffer)
+                 :checker flycheck-checker
+                 :filename buffer-file-name
+                 :line (gethash "StartLine" range)
+                 :column (gethash "StartColumn" range)
+                 :message (gethash "Info" lint-item)
+                 :level 'warning)))
+             (add-to-list 'parsed flycheck-item)))
+        (funcall flycheck-callback 'finished (delq nil parsed)))))
 
 (defun fsharp-ac--parse-symbol-uses (data)
   "Extract the symbol uses from the given process response DATA."
@@ -760,6 +812,7 @@ around to the start of the buffer."
          ((s-equals? "tooltip" kind) (fsharp-ac-handle-tooltip data))
          ((s-equals? "finddecl" kind) (fsharp-ac-visit-definition data))
          ((s-equals? "symboluse" kind) (fsharp-ac--handle-symboluse data))
+         ((s-equals? "lint" kind) (fsharp-ac--handle-lint data))
        (t
         (fsharp-ac-message-safely "Error: unrecognised message kind: '%s'" kind))))
 
@@ -769,6 +822,15 @@ around to the start of the buffer."
   (setq fsharp-ac-current-candidate data
         fsharp-ac-status 'idle)
   (fsharp-ac-completion-done))
+
+(defun fsharp-ac--handle-lint (data)
+  "Display error overlays and set buffer-local error variables for error navigation."
+  (when (eq major-mode 'fsharp-mode)
+    (unless (or (active-minibuffer-window) cursor-in-echo-area)
+      (fsharp-ac-clear-errors)
+      (let ((errs (fsharp-ac-parse-lint data)))
+        (setq fsharp-ac-errors errs)
+        (mapc 'fsharp-ac/show-error-overlay errs)))))
 
 (defun fsharp-ac-handle-doctext (data)
   (puthash (gethash "Name" data)
